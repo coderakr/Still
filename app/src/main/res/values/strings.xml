@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Still</string>
+    <string name="accessibility_description">Still reads the visible screen in supported apps to recognize short-form feeds and browser addresses. When an enabled rule matches, it returns you to the home screen. Screen content is processed on this device and is never stored or shared. You can pause protection in Still or disable this service here at any time.</string>
+</resources>
