@@ -34,6 +34,54 @@ Debug APK: `app/build/outputs/apk/debug/app-debug.apk`.
 
 Some devices require “Allow restricted settings” from the app's Android App info menu for a locally installed accessibility app. Android and manufacturer settings control service availability.
 
+## GitHub APK releases
+
+[Release APK](.github/workflows/release-apk.yml) runs when you push a version tag such as `v1.0.0`. It runs the project's debug unit tests and release lint, builds with JDK 21 and Android SDK 37, signs and verifies the APK, and uploads `Still-v1.0.0.apk` and its SHA-256 checksum to **GitHub → Releases**. Tags with a suffix such as `v1.1.0-beta.1` create prereleases. A failed build or signing check prevents publication.
+
+### One-time signing setup
+
+Use your existing release keystore if you have one. Otherwise, generate one outside the repository (the command prompts for passwords):
+
+```sh
+mkdir -p "$HOME/.android/keystores"
+keytool -genkeypair -v -storetype JKS \
+  -keystore "$HOME/.android/keystores/still-release.jks" \
+  -alias still -keyalg RSA -keysize 4096 -validity 10000
+```
+
+In **GitHub repository → Settings → Secrets and variables → Actions**, add these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Base64-encoded contents of your release keystore |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password |
+| `ANDROID_KEY_ALIAS` | Key alias (`still` for the command above) |
+| `ANDROID_KEY_PASSWORD` | Password for that key (may match the keystore password) |
+
+On Linux, obtain the base64 value with `base64 -w 0 "$HOME/.android/keystores/still-release.jks"` and copy it into the secret. Keep the keystore and passwords backed up securely, and reuse the same key for every release so Android can install updates. Keystore files are ignored by Git; do not commit passwords or base64 key data. The workflow uses the built-in `GITHUB_TOKEN` to publish; no personal access token is needed.
+
+### Publish a version
+
+1. Increase `versionCode` and update `versionName` in `app/build.gradle.kts`. Tags name releases; they do not change the app's embedded version.
+2. Commit and push your changes, including the workflow, then tag that commit:
+
+   ```sh
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+3. Follow **Actions → Release APK**. When it succeeds, download the APK from **Releases → Still v1.0.0 → Assets**.
+
+You can also choose **Actions → Release APK → Run workflow** and enter an existing version tag. The workflow always builds that tag's commit. Manual runs require the workflow on the default branch. Re-running a tag replaces matching assets on an existing editable release; immutable releases cannot have their assets replaced. Existing release descriptions and draft/prerelease status are preserved.
+
+Install the downloaded APK with:
+
+```sh
+adb install -r Still-v1.0.0.apk
+```
+
+A release signed with this new key cannot update a debug installation signed with a different key. Uninstall that debug installation once before installing the release (uninstalling deletes its saved settings).
+
 ## How blocking works
 
 `FocusAccessibilityService` inspects visible accessibility nodes in supported foreground apps. Feed detection checks known viewer resource IDs or an explicitly selected Shorts/Reels tab; merely seeing an unselected tab or a video mentioning “shorts” does not trigger a block. TikTok's selected rule intentionally blocks the whole app. Browser rules check only known address bar nodes, avoiding a focused address being edited. A match exits the feed player before returning to Home and presenting Still's intervention screen. Browser matches return straight to Home.
