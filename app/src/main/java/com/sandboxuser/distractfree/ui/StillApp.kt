@@ -39,6 +39,8 @@ import com.sandboxuser.distractfree.blocking.FocusAccessibilityService
 import com.sandboxuser.distractfree.blocking.FeedRule
 import com.sandboxuser.distractfree.data.FocusSettings
 import com.sandboxuser.distractfree.data.FocusStore
+import com.sandboxuser.distractfree.data.ConfirmationAction
+import com.sandboxuser.distractfree.data.PendingConfirmation
 import com.sandboxuser.distractfree.ui.theme.*
 import kotlinx.coroutines.delay
 import java.time.LocalDate
@@ -49,7 +51,7 @@ private val CardShape = RoundedCornerShape(24.dp)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun StillApp(breakRequest: Int = 0) {
+fun StillApp() {
     val context = LocalContext.current
     val store = remember { FocusStore.get(context) }
     val settings by store.state.collectAsState()
@@ -57,7 +59,9 @@ fun StillApp(breakRequest: Int = 0) {
     var blockTab by rememberSaveable { mutableIntStateOf(0) }
     var connected by remember { mutableStateOf(FocusAccessibilityService.isEnabled(context)) }
     var remaining by remember { mutableLongStateOf(store.remainingBreak()) }
-    var showBreak by rememberSaveable { mutableStateOf(false) }
+    val pending = settings.confirmation
+    val showBreak = pending?.action == ConfirmationAction.TAKE_BREAK
+    var confirmationRemaining by remember(pending) { mutableLongStateOf(store.remainingConfirmation()) }
     var showSetup by rememberSaveable { mutableStateOf(false) }
     var showWebsite by rememberSaveable { mutableStateOf(false) }
     var showHelp by rememberSaveable { mutableStateOf(false) }
@@ -73,8 +77,12 @@ fun StillApp(breakRequest: Int = 0) {
     LaunchedEffect(settings.breakDeadline, settings.breakBoot) {
         while (true) { remaining = store.remainingBreak(); delay(1000) }
     }
-    LaunchedEffect(breakRequest) { if (breakRequest > 0) showBreak = true }
-    BackHandler(tab != 0 && !showBreak && !showSetup && !showWebsite && !showHelp) { tab = 0 }
+    LaunchedEffect(pending) {
+        if (pending != null) {
+            while (true) { confirmationRemaining = store.remainingConfirmation(); delay(250) }
+        }
+    }
+    BackHandler(tab != 0 && pending == null && !showSetup && !showWebsite && !showHelp) { tab = 0 }
     val active = connected && settings.consent && settings.protection && remaining == 0L
     Scaffold(
         containerColor = Paper,
@@ -99,10 +107,10 @@ fun StillApp(breakRequest: Int = 0) {
                     BrandHeader(active, remaining > 0, connected && settings.consent)
                     when(selected) {
                         0 -> FocusScreen(settings, active, connected && settings.consent, remaining,
-                            onSetup = { showSetup = true }, onBreak = { showBreak = true }, onResume = store::endBreak,
+                            onSetup = { showSetup = true }, onBreak = store::requestBreakConfirmation, onResume = store::endBreak,
                             onProtection = store::setProtection,
                             onBlocks = { blockTab=0; tab=1 }, onWebsites = { blockTab=1; tab=1 }, onActivity = { tab=2 }, onFeed = store::setFeed)
-                        1 -> BlocksScreen(settings, blockTab, { blockTab = it }, store::setFeed, store::setWebsitesEnabled, { showWebsite = true }, store::removeWebsite, { showHelp = true })
+                        1 -> BlocksScreen(settings, blockTab, { blockTab = it }, store::setFeed, store::setWebsitesEnabled, { showWebsite = true }, store::requestWebsiteRemoval, { showHelp = true })
                         2 -> ActivityScreen(settings)
                         3 -> SettingsScreen(connected && settings.consent, { showSetup=true }, { showHelp=true }, { showClear=true })
                     }
@@ -112,11 +120,12 @@ fun StillApp(breakRequest: Int = 0) {
     }
     if (showBreak) {
         var minutes by rememberSaveable { mutableIntStateOf(5) }
-        ModalBottomSheet(sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true), onDismissRequest={showBreak=false}, containerColor=Paper) {
+        ModalBottomSheet(sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true), onDismissRequest=store::cancelConfirmation, containerColor=Paper) {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal=24.dp).padding(bottom=32.dp), verticalArrangement=Arrangement.spacedBy(20.dp)) {
                 IconTile("cup", Sage, Forest, 56)
                 Text("A break, on purpose.",style=MaterialTheme.typography.headlineMedium)
-                Text("A little scrolling is okay. Choose your time, and Still will take care of the return.",color=Muted)
+                Text("Give yourself two minutes to decide. Choose a break length while you wait, then confirm if you still want a break.",color=Muted)
+                ConfirmationCountdown(confirmationRemaining, "Your blocking rules stay in place while you wait.")
                 Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
                     listOf(5,10,15,30).forEach { value ->
                         Surface(onClick={minutes=value},modifier=Modifier.weight(1f),shape=RoundedCornerShape(18.dp),color=if(minutes==value) Forest else Color.White,border=BorderStroke(1.dp,if(minutes==value) Forest else Outline)) {
@@ -128,10 +137,28 @@ fun StillApp(breakRequest: Int = 0) {
                     }
                 }
                 Note("clock","All feed and website blocks pause together. Protection resumes automatically, even if you close Still. Restarting your phone ends the break.")
-                Button(onClick={store.startBreak(minutes);showBreak=false},modifier=Modifier.fillMaxWidth().heightIn(min=54.dp),shape=RoundedCornerShape(16.dp),enabled=connected && settings.consent && settings.protection) {
+                Button(onClick={
+                    connected = FocusAccessibilityService.isEnabled(context)
+                    if (connected) store.startBreak(minutes)
+                },modifier=Modifier.fillMaxWidth().heightIn(min=54.dp),shape=RoundedCornerShape(16.dp),enabled=confirmationRemaining == 0L && connected && settings.consent && settings.protection) {
                     Glyph("pause",tint=Color.White,size=18.dp); Spacer(Modifier.width(10.dp)); Text("Start $minutes-minute break")
                 }
                 if (!connected || !settings.consent || !settings.protection) Text("Turn on protection and finish setup before starting a break.",color=Amber,style=MaterialTheme.typography.bodySmall)
+                TextButton(onClick=store::cancelConfirmation,modifier=Modifier.align(Alignment.CenterHorizontally)) { Text("Keep focusing") }
+            }
+        }
+    }
+    if (pending?.action == ConfirmationAction.REMOVE_WEBSITE) {
+        ModalBottomSheet(sheetState=rememberModalBottomSheetState(skipPartiallyExpanded=true), onDismissRequest=store::cancelConfirmation, containerColor=Paper) {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal=24.dp).padding(bottom=32.dp),verticalArrangement=Arrangement.spacedBy(20.dp)) {
+                IconTile("globe", Sage, Forest, 56)
+                Text("Reconsider this boundary.",style=MaterialTheme.typography.headlineMedium)
+                Text("Take two minutes before removing ${pending.website}. It stays on your blocklist until you confirm.",color=Muted)
+                ConfirmationCountdown(confirmationRemaining, "Nothing will be removed automatically.")
+                Button(onClick={store.removeWebsite(pending.website)},enabled=confirmationRemaining == 0L,modifier=Modifier.fillMaxWidth().heightIn(min=54.dp),shape=RoundedCornerShape(16.dp)) {
+                    Glyph("trash",tint=Color.White,size=18.dp); Spacer(Modifier.width(10.dp)); Text("Remove website")
+                }
+                TextButton(onClick=store::cancelConfirmation,modifier=Modifier.align(Alignment.CenterHorizontally)) { Text("Keep website") }
             }
         }
     }
@@ -160,10 +187,26 @@ fun StillApp(breakRequest: Int = 0) {
             Text("Short-form: Still recognizes supported Shorts and Reels viewer screens. Normal YouTube videos and other app sections remain available. TikTok blocks the entire app.")
             Text("Websites: Chrome, Brave, Edge, Firefox, Samsung Internet, and Opera are supported when they expose the address bar. Subdomains are included. Short-form web URLs are checked too.")
             Text("Coverage depends on the app version, language, and accessible screen information. Hidden addresses, picture-in-picture, embedded browsers, and some feed layouts may not be detected. Disable picture-in-picture for video apps in Android settings for more reliable blocking. This is a screen-based blocker, not a network filter.")
-            Text("Breaks: All rules pause for your chosen duration and resume automatically. You can end a break early. A phone restart ends an active break.")
+            Text("Taking a break or removing a website requires a two-minute wait, followed by your confirmation. Closing the sheet cancels the request; trying again starts a fresh wait. Leaving the app keeps the pending countdown. A phone restart restarts the wait.")
+            Text("Breaks: After confirmation, all rules pause for your chosen duration and resume automatically. You can end a break early. A phone restart ends an active break.")
         }
     },confirmButton={TextButton(onClick={showHelp=false}) { Text("Got it") }})
     if(showClear) AlertDialog(onDismissRequest={showClear=false},title={Text("Clear activity?")},text={Text("This removes your daily and all-time block counts. Your rules and websites stay as they are.")},confirmButton={TextButton(onClick={store.clearStats();showClear=false}) { Text("Clear activity") }},dismissButton={TextButton(onClick={showClear=false}) { Text("Keep it") }})
+}
+
+@Composable
+private fun ConfirmationCountdown(remaining: Long, message: String) {
+    Surface(shape=RoundedCornerShape(20.dp),color=Sage) {
+        Column(Modifier.fillMaxWidth().padding(20.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                Glyph(if(remaining>0) "clock" else "check",size=20.dp)
+                Text(if(remaining>0) "TIME TO THINK" else "YOUR CHOICE",style=MaterialTheme.typography.labelSmall,color=Forest)
+            }
+            Text(if(remaining>0) formatTime(remaining) else "Ready to confirm",style=MaterialTheme.typography.headlineMedium)
+            LinearProgressIndicator(progress={ (1f - remaining.toFloat() / PendingConfirmation.WAIT_MILLIS).coerceIn(0f,1f) },modifier=Modifier.fillMaxWidth(),color=Forest,trackColor=Color.White)
+            Text(if(remaining>0) "$message You can cancel at any time, but this wait cannot be skipped." else "The wait is over. Confirm below, or keep your boundary.",style=MaterialTheme.typography.bodySmall,color=Forest)
+        }
+    }
 }
 
 @Composable

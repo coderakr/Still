@@ -1,5 +1,6 @@
 package com.sandboxuser.distractfree
 
+import android.os.SystemClock
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.platform.app.InstrumentationRegistry
@@ -34,6 +35,17 @@ class StillAppTest {
         compose.onNodeWithText("reddit.com").assertIsDisplayed()
         assertTrue(store.state.value.websites.contains("reddit.com"))
         compose.onNodeWithContentDescription("Remove reddit.com").performClick()
+        compose.onNodeWithText("Remove website").performScrollTo().assertIsNotEnabled()
+        assertTrue(store.state.value.websites.contains("reddit.com"))
+        val deadline = store.state.value.confirmation!!.deadline
+        compose.activityRule.scenario.recreate()
+        compose.onNodeWithText("Remove website").performScrollTo().assertIsNotEnabled()
+        assertEquals(deadline, store.state.value.confirmation!!.deadline)
+        expireConfirmation()
+        compose.onNodeWithText("Ready to confirm").assertExists()
+        // Finishing the countdown never removes a site without a second deliberate tap.
+        assertTrue(store.state.value.websites.contains("reddit.com"))
+        compose.onNodeWithText("Remove website").performScrollTo().assertIsEnabled().performClick()
         compose.onNodeWithText("Leave the rabbit holes behind.").performScrollTo().assertIsDisplayed()
         assertTrue(store.state.value.websites.isEmpty())
     }
@@ -55,11 +67,88 @@ class StillAppTest {
     }
 
     @Test fun breakSurvivesRecreationAndCanEndEarly() {
-        compose.runOnUiThread { store.startBreak(5) }
+        compose.runOnUiThread { store.consent(); store.requestBreakConfirmation() }
+        expireConfirmation()
+        compose.runOnUiThread { assertTrue(store.startBreak(5)) }
         assertTrue(store.remainingBreak() in 1..300_000)
         compose.activityRule.scenario.recreate()
         compose.onNodeWithText("End break early").assertIsDisplayed().performClick()
         compose.runOnIdle { assertEquals(0L,store.remainingBreak()) }
+    }
+
+    private fun expireConfirmation() {
+        // Test-only clock fixture: production has no API to shorten or bypass the wait.
+        compose.runOnUiThread {
+            context.getSharedPreferences("still_preferences",0).edit()
+                .putLong("confirmationDeadline", SystemClock.elapsedRealtime() - 1).commit()
+            store.refresh()
+        }
+        compose.waitForIdle()
+    }
+
+    @Test fun breakWaitSurvivesRecreationAndCancelStartsFresh() {
+        compose.runOnUiThread { store.consent(); store.requestBreakConfirmation() }
+        compose.onNodeWithText("Start 5-minute break").performScrollTo().assertIsNotEnabled()
+        val deadline = store.state.value.confirmation!!.deadline
+        compose.activityRule.scenario.recreate()
+        compose.onNodeWithText("Start 5-minute break").performScrollTo().assertIsNotEnabled()
+        assertEquals(deadline, store.state.value.confirmation!!.deadline)
+        compose.runOnIdle { assertTrue(store.blockingActive()); assertEquals(0L, store.remainingBreak()) }
+        expireConfirmation()
+        compose.runOnIdle { assertEquals(0L, store.remainingBreak()) }
+        compose.onNodeWithText("Keep focusing").performScrollTo().performClick()
+        compose.runOnIdle { assertNull(store.state.value.confirmation) }
+        compose.runOnUiThread { store.requestBreakConfirmation() }
+        compose.onNodeWithText("Start 5-minute break").performScrollTo().assertIsNotEnabled()
+        assertTrue(store.remainingConfirmation() > 115_000)
+    }
+
+    @Test fun storeRejectsEarlyWrongAndReplayedConfirmations() {
+        compose.runOnUiThread {
+            store.consent()
+            store.addWebsite("reddit.com")
+            store.addWebsite("youtube.com")
+            assertFalse(store.startBreak(5))
+            assertFalse(store.removeWebsite("reddit.com"))
+            store.requestBreakConfirmation()
+            assertFalse(store.startBreak(5))
+            assertTrue(store.blockingActive())
+        }
+        expireConfirmation()
+        compose.runOnUiThread {
+            assertFalse(store.removeWebsite("reddit.com"))
+            assertTrue(store.startBreak(5))
+            assertFalse(store.startBreak(5))
+            store.endBreak()
+            store.requestWebsiteRemoval("reddit.com")
+            assertFalse(store.removeWebsite("reddit.com"))
+        }
+        expireConfirmation()
+        compose.runOnUiThread {
+            assertFalse(store.removeWebsite("youtube.com"))
+            assertFalse(store.startBreak(5))
+            assertTrue(store.removeWebsite("reddit.com"))
+            assertFalse(store.removeWebsite("reddit.com"))
+            assertTrue(store.state.value.websites.contains("youtube.com"))
+        }
+    }
+
+    @Test fun cancelAndRebootCannotReuseAnUnlockedRemoval() {
+        compose.runOnUiThread { store.addWebsite("reddit.com"); store.requestWebsiteRemoval("reddit.com") }
+        expireConfirmation()
+        compose.onNodeWithText("Keep website").performScrollTo().performClick()
+        compose.runOnUiThread {
+            assertFalse(store.removeWebsite("reddit.com"))
+            store.requestWebsiteRemoval("reddit.com")
+            assertTrue(store.remainingConfirmation() > 115_000)
+        }
+        expireConfirmation()
+        compose.runOnUiThread {
+            context.getSharedPreferences("still_preferences",0).edit().putInt("confirmationBoot", -100).commit()
+            store.refresh()
+            assertTrue(store.remainingConfirmation() > 115_000)
+            assertFalse(store.removeWebsite("reddit.com"))
+        }
     }
 
     @Test fun countsAreRealAndCanBeCleared() {

@@ -21,7 +21,8 @@ data class FocusSettings(
     val todayBlocks: Int = 0,
     val totalBlocks: Int = 0,
     val week: List<Int> = List(7) { 0 },
-    val consent: Boolean = false
+    val consent: Boolean = false,
+    val confirmation: PendingConfirmation? = null
 ) {
     val ruleCount: Int get() = feeds.size + if (websitesEnabled) websites.size else 0
 }
@@ -32,9 +33,17 @@ class FocusStore private constructor(private val context: Context) {
     val state = mutable.asStateFlow()
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
 
-    init { prefs.registerOnSharedPreferenceChangeListener(listener) }
+    init { refresh(); prefs.registerOnSharedPreferenceChangeListener(listener) }
 
-    fun refresh() { mutable.value = read() }
+    fun refresh() {
+        // Elapsed time resets at reboot. Restart the wait instead of unlocking the action.
+        val pending = readConfirmation()
+        if (pending != null && pending.boot != bootCount()) {
+            prefs.edit().putLong("confirmationDeadline", SystemClock.elapsedRealtime() + PendingConfirmation.WAIT_MILLIS)
+                .putInt("confirmationBoot", bootCount()).apply()
+        }
+        mutable.value = read()
+    }
     private fun bootCount() = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
     fun remainingBreak(settings: FocusSettings = state.value): Long = BreakClock.remaining(
         settings.breakDeadline, settings.breakBoot, bootCount(), SystemClock.elapsedRealtime()
@@ -52,11 +61,40 @@ class FocusStore private constructor(private val context: Context) {
         prefs.edit().putStringSet("websites", state.value.websites + domain).apply()
         return null
     }
-    fun removeWebsite(domain: String) { prefs.edit().putStringSet("websites", state.value.websites - domain).apply() }
-    fun startBreak(minutes: Int) {
+    fun requestBreakConfirmation() { requestConfirmation(ConfirmationAction.TAKE_BREAK) }
+    fun requestWebsiteRemoval(domain: String) {
+        if (domain in state.value.websites) requestConfirmation(ConfirmationAction.REMOVE_WEBSITE, domain)
+    }
+    private fun requestConfirmation(action: ConfirmationAction, website: String = "") {
+        refresh()
+        val pending = state.value.confirmation
+        // Reopening the same pending request (including after process recreation) keeps its deadline.
+        if (pending?.action == action && pending.website == website) return
+        prefs.edit().putString("confirmationAction", action.name).putString("confirmationWebsite", website)
+            .putLong("confirmationDeadline", SystemClock.elapsedRealtime() + PendingConfirmation.WAIT_MILLIS)
+            .putInt("confirmationBoot", bootCount()).apply()
+    }
+    fun remainingConfirmation(): Long = state.value.confirmation?.remaining(SystemClock.elapsedRealtime(), bootCount())
+        ?: PendingConfirmation.WAIT_MILLIS
+    fun cancelConfirmation() { prefs.edit().clearConfirmation().apply() }
+    private fun SharedPreferences.Editor.clearConfirmation(): SharedPreferences.Editor =
+        remove("confirmationAction").remove("confirmationWebsite").remove("confirmationDeadline").remove("confirmationBoot")
+
+    private fun canConfirm(action: ConfirmationAction, website: String = ""): Boolean {
+        refresh()
+        return state.value.confirmation?.permits(action, website, SystemClock.elapsedRealtime(), bootCount()) == true
+    }
+    fun removeWebsite(domain: String): Boolean {
+        if (!canConfirm(ConfirmationAction.REMOVE_WEBSITE, domain) || domain !in state.value.websites) return false
+        prefs.edit().putStringSet("websites", state.value.websites - domain).clearConfirmation().apply()
+        return true
+    }
+    fun startBreak(minutes: Int): Boolean {
         require(minutes in setOf(5, 10, 15, 30))
+        if (!canConfirm(ConfirmationAction.TAKE_BREAK) || !state.value.consent || !state.value.protection) return false
         prefs.edit().putLong("breakDeadline", SystemClock.elapsedRealtime() + minutes * 60_000L)
-            .putInt("breakBoot", bootCount()).apply()
+            .putInt("breakBoot", bootCount()).clearConfirmation().apply()
+        return true
     }
     fun endBreak() { prefs.edit().putLong("breakDeadline", 0).apply() }
     fun consent() { prefs.edit().putBoolean("consent", true).apply() }
@@ -76,6 +114,11 @@ class FocusStore private constructor(private val context: Context) {
         prefs.all.keys.filter { it.startsWith("blocks_") }.forEach { editor.remove(it) }
         editor.apply()
     }
+    private fun readConfirmation(): PendingConfirmation? {
+        val action = ConfirmationAction.entries.find { it.name == prefs.getString("confirmationAction", null) } ?: return null
+        val deadline = prefs.getLong("confirmationDeadline", 0).takeIf { it > 0 } ?: return null
+        return PendingConfirmation(action, prefs.getString("confirmationWebsite", "").orEmpty(), deadline, prefs.getInt("confirmationBoot", -1))
+    }
     private fun read(): FocusSettings {
         val today = LocalDate.now()
         return FocusSettings(
@@ -88,7 +131,8 @@ class FocusStore private constructor(private val context: Context) {
             todayBlocks = prefs.getInt("blocks_$today", 0),
             totalBlocks = prefs.getInt("totalBlocks", 0),
             week = (6 downTo 0).map { prefs.getInt("blocks_${today.minusDays(it.toLong())}", 0) },
-            consent = prefs.getBoolean("consent", false)
+            consent = prefs.getBoolean("consent", false),
+            confirmation = readConfirmation()
         )
     }
 
